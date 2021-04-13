@@ -1,15 +1,20 @@
 package cmd
 
 import (
+  "bufio"
   "bytes"
   "encoding/json"
+  "flag"
   "fmt"
   "io/ioutil"
   "net/http"
   "os"
   "regexp"
   "strconv"
+  "strings"
+  "time"
 
+  "github.com/cheggaaa/pb/v3"
   "github.com/piquette/finance-go/quote"
 )
 
@@ -99,6 +104,12 @@ type ModifiedTransaction struct {
   Subtransactions *[]ModifiedSubTransaction `json:"subtransactions"`
 }
 
+type ErrorDetails struct {
+  Id string
+  Name string
+  Detail string
+}
+
 type Budgets struct {
   Budgets       []Budget
   DefaultBudget Budget   `json:"default_budget"`
@@ -110,11 +121,15 @@ type Transactions struct {
 }
 
 type BudgetData struct {
-  Data Budgets
+  Data *Budgets
 }
 
 type TransactionData struct {
-  Data Transactions
+  Data *Transactions
+}
+
+type Error struct {
+  Error ErrorDetails
 }
 
 type ModifiedTransactions struct {
@@ -141,7 +156,7 @@ var (
   config Config
   client = &http.Client{}
   matchMemo *regexp.Regexp
-  prices = make(map[string]string)
+  prices = map[string]string{}
   modified = false
 )
 
@@ -153,13 +168,11 @@ func Execute() error {
     return fmt.Errorf("Failed to compile regex.")
   }
 
-  configData, err := os.ReadFile("config.json")
-  if err != nil {
-    return fmt.Errorf("Unable to read config file.")
-  }
-  err = json.Unmarshal(configData, &config)
-  if err != nil || config.Budgets == nil {
-    return fmt.Errorf("Unable to read config file.")
+  configFile := flag.String("c", "config.json", "Configuration file")
+  flag.Parse()
+
+  if err := TryReadConfig(configFile); err != nil {
+    return err
   }
 
   budgets, err := GetBudgets()
@@ -180,13 +193,73 @@ func Execute() error {
       return err
     }
 
-    err = os.WriteFile("config.json", res, 0600)
+    err = os.WriteFile(*configFile, res, 0600)
     if err != nil {
       return err
     }
   }
 
   return nil
+}
+
+func TryReadConfig(path *string) error {
+  fmt.Printf("Using config file at path %s.\n", *path)
+  configData, err := os.ReadFile(*path)
+  if err != nil {
+    fmt.Print("Config file does not exist. Create one? [y/N] ")
+
+    if TryCreateConfig(path) {
+      return nil
+    }
+    return fmt.Errorf("Config file does not exist.")
+  }
+  err = json.Unmarshal(configData, &config)
+  if err != nil || config.Budgets == nil {
+    fmt.Print("Unable to read config file. Overwrite? [y/N] ")
+
+    if TryCreateConfig(path) {
+      return nil
+    }
+    return fmt.Errorf("Unable to read config file.")
+  }
+
+  return nil
+}
+
+func TryCreateConfig(path *string) bool {
+  reader := bufio.NewReader(os.Stdin)
+  input, err := reader.ReadString('\n')
+  if err != nil {
+    return false
+  }
+  input = strings.TrimSuffix(input, "\n")
+
+  if input != "y" && input != "Y" {
+    return false
+  }
+
+
+  for {
+    fmt.Print("YNAB API Token: ")
+    input, err = reader.ReadString('\n')
+    if err != nil {
+      return false
+    }
+    input = strings.TrimSuffix(input, "\n")
+
+    if input != "" {
+      break
+    }
+  }
+
+  config = Config{
+    YnabToken: input,
+    Budgets: map[string]*BudgetConfig{},
+  }
+
+  modified = true
+
+  return true
 }
 
 func ProcessBudget(budget string) error {
@@ -196,7 +269,10 @@ func ProcessBudget(budget string) error {
     serverKnowledge = budgetConfig.ServerKnowledge
   } else {
     serverKnowledge = 0
-    budgetConfig.Transactions = make(map[string]TransactionConfig, 0)
+    budgetConfig = &BudgetConfig{
+      Transactions: map[string]TransactionConfig{},
+    }
+    config.Budgets[budget] = budgetConfig
   }
 
   serverKnowledge, modifiedTransactions, transactionConfigs, err := GetTransactions(budget, serverKnowledge)
@@ -250,29 +326,23 @@ func ProcessBudget(budget string) error {
     return err
   }
 
-  var result map[string](map[string]interface{})
-  err = json.Unmarshal(body, &result)
+  var transactionData TransactionData
+  err = json.Unmarshal(body, &transactionData)
   if err != nil {
     return err
   }
 
-  if errData, ok := result["error"]; ok {
-    if str, ok := errData["detail"].(string); ok {
-      return fmt.Errorf(str)
-    } else {
-      return fmt.Errorf("Unknown error with PATCH request.")
+  if transactionData.Data == nil {
+    var errData Error
+    err = json.Unmarshal(body, &errData)
+    if err != nil {
+      return err
     }
+
+    return fmt.Errorf(errData.Error.Detail)
   }
 
-  if data, ok := result["data"]; ok {
-    if serverKnowledge, ok := data["server_knowledge"].(float64); ok {
-      newBudget.ServerKnowledge = uint64(serverKnowledge)
-    } else {
-      return fmt.Errorf("Error parsing server_knowledge.")
-    }
-  } else {
-    return fmt.Errorf("Unexpected response with PATCH request.")
-  }
+  newBudget.ServerKnowledge = transactionData.Data.ServerKnowledge
 
   return nil
 }
@@ -300,6 +370,16 @@ func GetBudgets() ([]string, error) {
   err = json.Unmarshal(body, &budgetData)
   if err != nil {
     return nil, err
+  }
+
+  if budgetData.Data == nil {
+    var errData Error
+    err = json.Unmarshal(body, &errData)
+    if err != nil {
+      return nil, err
+    }
+
+    return nil, fmt.Errorf(errData.Error.Detail)
   }
 
   budgets := make([]string, len(budgetData.Data.Budgets))
@@ -335,6 +415,16 @@ func GetTransactions(budget string, serverKnowledge uint64) (uint64, []ModifiedT
     return 0, nil, nil, err
   }
 
+  if transactionData.Data == nil {
+    var errData Error
+    err = json.Unmarshal(body, &errData)
+    if err != nil {
+      return 0, nil, nil, err
+    }
+
+    return 0, nil, nil, fmt.Errorf(errData.Error.Detail)
+  }
+
   budgetConfig, ok := config.Budgets[budget]
   if !ok {
     budgetConfig = &BudgetConfig{}
@@ -345,15 +435,20 @@ func GetTransactions(budget string, serverKnowledge uint64) (uint64, []ModifiedT
   }
 
   transactionConfigs := budgetConfig.Transactions
-  modifiedTransactions := make([]ModifiedTransaction, 0)
+  modifiedTransactions := []ModifiedTransaction{}
 
   if transactionData.Data.ServerKnowledge == serverKnowledge {
     return serverKnowledge, modifiedTransactions, budgetConfig.Transactions, nil
   }
   modified = true
 
+  bar := pb.StartNew(len(transactionData.Data.Transactions))
+
   for _, transaction := range transactionData.Data.Transactions {
-    if transaction.Deleted || len(transaction.Subtransactions) > 0 {
+    bar.Increment()
+    time.Sleep(time.Millisecond)
+
+    if transaction.Deleted || len(transaction.Subtransactions) > 0 || transaction.Memo == nil {
       delete(transactionConfigs, transaction.Id)
       continue
     }
@@ -409,6 +504,8 @@ func GetTransactions(budget string, serverKnowledge uint64) (uint64, []ModifiedT
       Symbol: symbol,
     }
   }
+
+  bar.Finish()
 
   return transactionData.Data.ServerKnowledge, modifiedTransactions, transactionConfigs, nil
 }
