@@ -133,22 +133,22 @@ type Error struct {
 }
 
 type ModifiedTransactions struct {
-  Transactions []ModifiedTransaction `json:"transactions"`
+  Transactions []*ModifiedTransaction `json:"transactions"`
 }
 
 type TransactionConfig struct {
-  LastPrice string `json:"last_price"`
-  Amount    string `json:"amount"`
-  Symbol    string `json:"symbol"`
+  Symbol string               `json:"symbol"`
+  Amount float64              `json:"amount"`
+  Data   *ModifiedTransaction `json:"data"`
 }
 
 type BudgetConfig struct {
-  ServerKnowledge uint64                       `json:"server_knowledge"` 
+  ServerKnowledge uint64                       `json:"server_knowledge"`
   Transactions    map[string]TransactionConfig `json:"transactions"`
 }
 
 type Config struct {
-  YnabToken string                   `json:"ynab_token"`
+  YnabToken *string                  `json:"ynab_token"`
   Budgets   map[string]*BudgetConfig `json:"budgets"`
 }
 
@@ -156,8 +156,7 @@ var (
   config Config
   client = &http.Client{}
   matchMemo *regexp.Regexp
-  prices = map[string]string{}
-  modified = false
+  prices = map[string]float64{}
 )
 
 func Execute() error {
@@ -180,6 +179,10 @@ func Execute() error {
     return err
   }
 
+  if config.Budgets == nil {
+    config.Budgets = map[string]*BudgetConfig{}
+  }
+
   for _, budget := range budgets {
     err = ProcessBudget(budget)
     if err != nil {
@@ -187,16 +190,14 @@ func Execute() error {
     }
   }
 
-  if modified {
-    res, err := json.Marshal(config)
-    if err != nil {
-      return err
-    }
+  res, err := json.Marshal(config)
+  if err != nil {
+    return err
+  }
 
-    err = os.WriteFile(*configFile, res, 0600)
-    if err != nil {
-      return err
-    }
+  err = os.WriteFile(*configFile, res, 0600)
+  if err != nil {
+    return err
   }
 
   return nil
@@ -214,7 +215,7 @@ func TryReadConfig(path *string) error {
     return fmt.Errorf("Config file does not exist.")
   }
   err = json.Unmarshal(configData, &config)
-  if err != nil || config.Budgets == nil {
+  if err != nil || config.YnabToken == nil {
     fmt.Print("Unable to read config file. Overwrite? [y/N] ")
 
     if TryCreateConfig(path) {
@@ -253,45 +254,25 @@ func TryCreateConfig(path *string) bool {
   }
 
   config = Config{
-    YnabToken: input,
-    Budgets: map[string]*BudgetConfig{},
+    YnabToken: &input,
   }
-
-  modified = true
 
   return true
 }
 
 func ProcessBudget(budget string) error {
   budgetConfig, ok := config.Budgets[budget]
-  var serverKnowledge uint64
-  if ok {
-    serverKnowledge = budgetConfig.ServerKnowledge
-  } else {
-    serverKnowledge = 0
+  if !ok {
     budgetConfig = &BudgetConfig{
+      ServerKnowledge: 0,
       Transactions: map[string]TransactionConfig{},
     }
     config.Budgets[budget] = budgetConfig
   }
 
-  serverKnowledge, modifiedTransactions, transactionConfigs, err := GetTransactions(budget, serverKnowledge)
+  modifiedTransactions, err := GetTransactions(budget, budgetConfig)
   if err != nil {
     return err
-  }
-
-  newBudget := BudgetConfig{
-    Transactions: transactionConfigs,
-    ServerKnowledge: serverKnowledge,
-  }
-
-  if !modified {
-    for transactionId := range budgetConfig.Transactions {
-      if _, ok := transactionConfigs[transactionId]; !ok {
-        modified = true
-        break
-      }
-    }
   }
 
   requestBody, err := json.Marshal(ModifiedTransactions{
@@ -301,14 +282,12 @@ func ProcessBudget(budget string) error {
     return err
   }
 
-  config.Budgets[budget] = &newBudget
-
   if len(modifiedTransactions) == 0 {
     return nil
   }
 
   request, err := http.NewRequest("PATCH", fmt.Sprintf("https://api.youneedabudget.com/v1/budgets/%s/transactions", budget), bytes.NewBuffer(requestBody))
-  request.Header.Set("Authorization", "Bearer " + config.YnabToken)
+  request.Header.Set("Authorization", "Bearer " + *config.YnabToken)
   request.Header.Set("Content-Type", "application/json")
   if err != nil {
     return err
@@ -342,14 +321,14 @@ func ProcessBudget(budget string) error {
     return fmt.Errorf(errData.Error.Detail)
   }
 
-  newBudget.ServerKnowledge = transactionData.Data.ServerKnowledge
+  budgetConfig.ServerKnowledge = transactionData.Data.ServerKnowledge
 
   return nil
 }
 
 func GetBudgets() ([]string, error) {
   request, err := http.NewRequest("GET", "https://api.youneedabudget.com/v1/budgets", nil)
-  request.Header.Set("Authorization", "Bearer " + config.YnabToken)
+  request.Header.Set("Authorization", "Bearer " + *config.YnabToken)
   if err != nil {
     return nil, err
   }
@@ -390,66 +369,51 @@ func GetBudgets() ([]string, error) {
   return budgets, nil
 }
 
-func GetTransactions(budget string, serverKnowledge uint64) (uint64, []ModifiedTransaction, map[string]TransactionConfig, error) {
-  request, err := http.NewRequest("GET", fmt.Sprintf("https://api.youneedabudget.com/v1/budgets/%s/transactions?last_knowledge_of_server=%d", budget, serverKnowledge), nil)
-  request.Header.Set("Authorization", "Bearer " + config.YnabToken)
+func GetTransactions(budget string, budgetConfig *BudgetConfig) ([]*ModifiedTransaction, error) {
+  request, err := http.NewRequest("GET", fmt.Sprintf("https://api.youneedabudget.com/v1/budgets/%s/transactions?last_knowledge_of_server=%d", budget, budgetConfig.ServerKnowledge), nil)
+  request.Header.Set("Authorization", "Bearer " + *config.YnabToken)
   if err != nil {
-    return 0, nil, nil, err
+    return nil, err
   }
 
   resp, err := client.Do(request)
   if err != nil {
-    return 0, nil, nil, err
+    return nil, err
   }
 
   defer resp.Body.Close()
 
   body, err := ioutil.ReadAll(resp.Body)
   if err != nil {
-    return 0, nil, nil, err
+    return nil, err
   }
 
   var transactionData TransactionData
   err = json.Unmarshal(body, &transactionData)
   if err != nil {
-    return 0, nil, nil, err
+    return nil, err
   }
 
   if transactionData.Data == nil {
     var errData Error
     err = json.Unmarshal(body, &errData)
     if err != nil {
-      return 0, nil, nil, err
+      return nil, err
     }
 
-    return 0, nil, nil, fmt.Errorf(errData.Error.Detail)
+    return nil, fmt.Errorf(errData.Error.Detail)
   }
 
-  budgetConfig, ok := config.Budgets[budget]
-  if !ok {
-    budgetConfig = &BudgetConfig{}
-  }
+  modifiedTransactions := []*ModifiedTransaction{}
 
-  if budgetConfig.Transactions == nil {
-    budgetConfig.Transactions = map[string]TransactionConfig{}
-  }
-
-  transactionConfigs := budgetConfig.Transactions
-  modifiedTransactions := []ModifiedTransaction{}
-
-  if transactionData.Data.ServerKnowledge == serverKnowledge {
-    return serverKnowledge, modifiedTransactions, budgetConfig.Transactions, nil
-  }
-  modified = true
-
-  bar := pb.StartNew(len(transactionData.Data.Transactions))
+  bar := pb.StartNew(len(transactionData.Data.Transactions) + len(budgetConfig.Transactions))
 
   for _, transaction := range transactionData.Data.Transactions {
     bar.Increment()
     time.Sleep(time.Millisecond)
 
     if transaction.Deleted || len(transaction.Subtransactions) > 0 || transaction.Memo == nil {
-      delete(transactionConfigs, transaction.Id)
+      delete(budgetConfig.Transactions, transaction.Id)
       continue
     }
 
@@ -458,34 +422,27 @@ func GetTransactions(budget string, serverKnowledge uint64) (uint64, []ModifiedT
       continue
     }
     symbol := match[1]
-    amount := match[2]
-    amountFl, err := strconv.ParseFloat(match[2], 64)
+    amount, err := strconv.ParseFloat(match[2], 64)
     if err != nil {
-      return 0, nil, nil, err
+      return nil, err
     }
 
-    if (amountFl > 0) != (transaction.Amount > 0) {
+    if (amount > 0) != (transaction.Amount > 0) {
       continue
     }
 
-    price, err := GetPrice(symbol)
-    if err != nil {
-      return 0, nil, nil, err
+    if _, ok := budgetConfig.Transactions[transaction.Id]; !ok {
+      bar.AddTotal(1)
     }
 
-    priceFl, err := strconv.ParseFloat(price, 64)
-    if err != nil {
-      return 0, nil, nil, err
-    }
-
-    transactionConfig, ok := budgetConfig.Transactions[transaction.Id]
-    if !ok || price != transactionConfig.LastPrice || amount != transactionConfig.Amount ||
-        symbol != transactionConfig.Symbol {
-      modifiedTransactions = append(modifiedTransactions, ModifiedTransaction{
+    budgetConfig.Transactions[transaction.Id] = TransactionConfig{
+      Symbol: symbol,
+      Amount: amount,
+      Data: &ModifiedTransaction{
         Id: transaction.Id,
         AccountId: transaction.AccountId,
         Date: transaction.Date,
-        Amount: int64(amountFl * priceFl * 1000),
+        Amount: transaction.Amount,
         PayeeId: transaction.PayeeId,
         PayeeName: transaction.PayeeName,
         CategoryId: transaction.CategoryId,
@@ -495,22 +452,33 @@ func GetTransactions(budget string, serverKnowledge uint64) (uint64, []ModifiedT
         FlagColor: transaction.FlagColor,
         ImportId: transaction.ImportId,
         Subtransactions: nil,
-      })
+      },
+    }
+  }
+
+  for _, transaction := range budgetConfig.Transactions {
+    bar.Increment()
+    time.Sleep(time.Millisecond)
+
+    price, err := GetPrice(transaction.Symbol)
+    if err != nil {
+      return nil, err
     }
 
-    transactionConfigs[transaction.Id] = TransactionConfig{
-      LastPrice: price,
-      Amount: amount,
-      Symbol: symbol,
+    newAmount := int64(transaction.Amount * price * 1000)
+    if newAmount != transaction.Data.Amount {
+      transaction.Data.Amount = newAmount
+      modifiedTransactions = append(modifiedTransactions, transaction.Data)
     }
   }
 
   bar.Finish()
+  budgetConfig.ServerKnowledge = transactionData.Data.ServerKnowledge
 
-  return transactionData.Data.ServerKnowledge, modifiedTransactions, transactionConfigs, nil
+  return modifiedTransactions, nil
 }
 
-func GetPrice(symbol string) (string, error) {
+func GetPrice(symbol string) (float64, error) {
   price, ok := prices[symbol]
   if ok {
     return price, nil
@@ -518,10 +486,9 @@ func GetPrice(symbol string) (string, error) {
 
   q, err := quote.Get(symbol)
   if err != nil {
-    return "", err
+    return 0, err
   }
 
-  price = strconv.FormatFloat(q.RegularMarketPrice, 'f', 4, 64)
-  prices[symbol] = price
-  return price, err
+  prices[symbol] = q.RegularMarketPrice
+  return q.RegularMarketPrice, err
 }
